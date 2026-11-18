@@ -79,7 +79,11 @@ METRICS = [
 ]
 BILLS = ("Fruit_Bills", "Veg_Bills", "PL_Bills")
 SCAN_NAMES = ["scan_percentage", "scan_pct", "scan %"]
-DATE_FORMATS = ["%d-%b-%y", "%d-%b-%Y", "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%y", "%d-%m-%y"]
+DATE_FORMATS = [          # tried in this order; the one that reads the most values wins
+    "%d-%b-%Y", "%d-%b-%y", "%d %b %Y", "%d %b %y", "%d-%B-%Y", "%Y-%m-%d", "%Y/%m/%d",
+    "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%d-%m-%y",
+    "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y",
+]
 
 
 # ----------------------------------------------------------------------------
@@ -127,22 +131,48 @@ def sid(v):
     return s
 
 
-_date_cache = {}
+def clean_date_text(v):
+    s = str(v).strip()
+    if not s:
+        return ""
+    if re.fullmatch(r"\d{5}(\.\d+)?", s):                     # Sheets/Excel serial number
+        return (dt.date(1899, 12, 30) + dt.timedelta(days=int(float(s)))).strftime("%Y-%m-%d")
+    s = re.sub(r"(?i)\bsept\b", "Sep", s)
+    return re.split(r"[ T]+(?=\d{1,2}:\d{2})", s)[0].strip()      # drop any time part
 
 
-def parse_date(s):
-    s = str(s).strip()
-    if s in _date_cache:
-        return _date_cache[s]
-    out = None
-    for fmt in DATE_FORMATS:
-        try:
-            out = dt.datetime.strptime(s, fmt).date()
-            break
-        except ValueError:
-            continue
-    _date_cache[s] = out
-    return out
+def _try_date(s, fmt):
+    try:
+        return dt.datetime.strptime(s, fmt).date()
+    except ValueError:
+        return None
+
+
+class DateParser:
+    """Detects the date format of the whole dt column once, then reads every row with it."""
+
+    def __init__(self, raw_values):
+        vals = {clean_date_text(v) for v in raw_values}
+        vals.discard("")
+        score = {f: sum(1 for v in vals if _try_date(v, f)) for f in DATE_FORMATS}
+        self.fmt = max(DATE_FORMATS, key=lambda f: score[f])     # first wins on ties
+        self.ok, self.total = score[self.fmt], len(vals)
+        mirror = {"%d/%m/%Y": "%m/%d/%Y", "%d/%m/%y": "%m/%d/%y", "%d-%m-%Y": "%m-%d-%Y"}.get(self.fmt)
+        self.ambiguous = bool(mirror and score[mirror] == self.ok)
+        self.cache = {}
+
+    def __call__(self, raw):
+        s = clean_date_text(raw)
+        if s in self.cache:
+            return self.cache[s]
+        d = _try_date(s, self.fmt)
+        if d is None:
+            for f in DATE_FORMATS:
+                d = _try_date(s, f)
+                if d:
+                    break
+        self.cache[s] = d
+        return d
 
 
 def compact(x):
@@ -181,26 +211,47 @@ def http_get(url, timeout=180):
         return r.read(), r.headers.get("Content-Type", "")
 
 
-def fetch_tab(sheet_url, tab, need, gid=None):
-    """Download one tab as CSV text. `need` = normalised header names that must be present.
+def resolve_gid(sheet_id, tab):
+    """Find a tab's gid from its name (best effort - reads the public page of the sheet)."""
+    want = tab.strip().lower()
+    for url in (f"https://docs.google.com/spreadsheets/d/{sheet_id}/htmlview",
+                f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"):
+        try:
+            page, _ = http_get(url, timeout=60)
+        except (urllib.error.URLError, OSError):
+            continue
+        html = page.decode("utf-8", errors="replace")
+        pairs = re.findall(r'name:\s*"((?:[^"\\]|\\.)*)"[^{}]{0,300}?gid:\s*"(\d+)"', html)
+        pairs += [(n, g) for g, n in re.findall(r'sheet-button-(\d+)"[^>]*>(?:\s*<[^>]+>)*\s*([^<]+?)\s*<', html)]
+        pairs += re.findall(r'"name":"((?:[^"\\]|\\.)*)"[^{}]{0,200}?"sheetId":(\d+)', html)
+        for name, gid in pairs:
+            if name.replace('\\"', '"').strip().lower() == want:
+                return gid
+    return None
 
-    Tries the raw export (by gid) first - it keeps every cell exactly as shown - then the
-    tab-name endpoint. Returns the first response whose header has all the `need` columns.
+
+def fetch_tab(sheet_url, tab, need, gid=None, allow_url_gid=False):
+    """Download one tab as CSV text. `need` = groups of accepted header names that must all be present.
+
+    Order: (1) the tab found BY NAME, exported exactly as shown, (2) the tab-name endpoint,
+    (3) only if allowed, the gid in the sheet link (it may be a different tab - warned loudly).
     """
     m = re.search(r"/d/([A-Za-z0-9_-]+)", sheet_url)
     if not m:
         die("Could not find the sheet id in SHEET_URL.")
     sheet_id = m.group(1)
-    if gid is None:
-        g = re.search(r"[#&?]gid=(\d+)", sheet_url)
-        gid = g.group(1) if g else None
+    base = f"https://docs.google.com/spreadsheets/d/{sheet_id}"
+    url_gid = (re.search(r"[#&?]gid=(\d+)", sheet_url) or [None, None])[1]
     tries = []
+    if gid is None:
+        gid = resolve_gid(sheet_id, tab)
     if gid is not None:
-        tries.append((f"gid {gid}", f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"))
-    tries.append((f"tab name '{tab}'", f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?"
-                  f"tqx=out:csv&sheet={urllib.parse.quote(tab)}"))
+        tries.append((f"tab '{tab}' (gid {gid})", f"{base}/export?format=csv&gid={gid}", "exact"))
+    tries.append((f"tab '{tab}' (by name)", f"{base}/gviz/tq?tqx=out:csv&sheet={urllib.parse.quote(tab)}", "gviz"))
+    if allow_url_gid and url_gid is not None and url_gid != gid:
+        tries.append((f"link gid {url_gid}", f"{base}/export?format=csv&gid={url_gid}", "link"))
     notes = []
-    for label, url in tries:
+    for label, url, kind in tries:
         try:
             data, _ = http_get(url)
         except (urllib.error.URLError, OSError) as e:
@@ -214,11 +265,17 @@ def fetch_tab(sheet_url, tab, need, gid=None):
         header, _rows = parse_csv_text(text.split("\n", 1)[0] + "\n")
         have = {norm(h) for h in header}
         if all(any(norm(n) in have for n in group) for group in need):
-            say(f"  downloaded '{tab}' via {label} ({len(data)/1024:,.0f} KB)")
+            say(f"  downloaded {label} - {len(data)/1024:,.0f} KB, {len(header)} columns (last: {header[-1]})")
+            if kind == "gviz":
+                say("  note: loaded by tab name; if totals look low, run with --gid <number from the tab's address bar>")
+            if kind == "link":
+                say(f"  WARNING: the tab '{tab}' could not be found by name, so gid {url_gid} from the link was used.")
+                say("           That may be a different tab. Open the base_1 tab, copy the number after gid= and run --gid <number>.")
             return text
-        notes.append(f"{label}: this is not the '{tab}' tab (columns {', '.join(header[:6])}...)")
+        notes.append(f"{label}: columns do not match the '{tab}' tab ({', '.join(header[:6])}...)")
     die(f"Could not download tab '{tab}' from Google Sheets.\n  - " + "\n  - ".join(notes) +
-        "\n  Fix the sharing, or save the tab as a CSV and run:  python omni_metric.py --csv <file> --no-push")
+        f"\n  Fix the sharing, or open the tab, copy the number after gid= in the address bar and run:"
+        f"  python omni_metric.py --gid <number>\n  Or save the tab as CSV and run:  python omni_metric.py --csv <file> --no-push")
 
 
 # ----------------------------------------------------------------------------
@@ -309,15 +366,19 @@ def build_data(base_text, stores, store_ix):
     if k_scan is None:
         missing_cols.append("Scan_Percentage")
 
+    dp = DateParser([r.get(k_dt, "") for r in rows_in])
     out_rows, bad_dt, bad_src, skipped = [], 0, 0, 0
+    bad_samples = []
     unknown, seen = set(), set()
     raw_tot = [0.0] * len(METRICS)
     week_days, month_last = {}, {}
     last_date = None
     for r in rows_in:
-        d = parse_date(r.get(k_dt, ""))
+        d = dp(r.get(k_dt, ""))
         if d is None:
             bad_dt += 1
+            if len(bad_samples) < 5:
+                bad_samples.append(r.get(k_dt, ""))
             continue
         src = r.get(k_src, "").strip().upper()
         if src not in ("ECOM", "POS"):
@@ -367,6 +428,9 @@ def build_data(base_text, stores, store_ix):
         "orders": emb[0], "gmv": emb[1], "drift": max(abs(e - t) for e, t in zip(emb, raw_tot)),
         "bad_dt": bad_dt, "bad_src": bad_src, "skipped": skipped, "unknown": unknown,
         "idle": [s[0] for s in stores if s[0] not in seen], "missing_cols": missing_cols,
+        "fmt": dp.fmt, "fmt_ok": dp.ok, "fmt_total": dp.total, "ambiguous": dp.ambiguous, "bad_samples": bad_samples,
+        "first_date": min(dp(r.get(k_dt, "")) for r in rows_in if dp(r.get(k_dt, ""))),
+        "raw_first": rows_in[0].get(k_dt, ""), "raw_last": rows_in[-1].get(k_dt, ""), "n_in": len(rows_in),
         "bill_totals": {b: emb[[m[0] for m in METRICS].index(b)] for b in BILLS},
     }
     return data, info
@@ -423,6 +487,7 @@ def main():
     ap = argparse.ArgumentParser(description="Download base_1 from Google Sheets, build Omni Metric, push to GitHub")
     ap.add_argument("--csv", help="use this local base_1 CSV instead of downloading the sheet")
     ap.add_argument("--stores", help="local store master CSV (default: Store_Mas.csv next to the script, else the sheet tab)")
+    ap.add_argument("--gid", help="gid of the base_1 tab (the number after gid= in the tab's address bar)")
     ap.add_argument("--no-push", action="store_true", help="build only, do not touch GitHub")
     ap.add_argument("--force", action="store_true", help="push even if the safety checks fail")
     ap.add_argument("--logo", help="logo file or URL (default: logo.* next to the script, else the KPN logo URL)")
@@ -438,7 +503,8 @@ def main():
         say(f"  base data: {a.csv} (local file)")
         base_text = read_local_csv(a.csv)
     else:
-        base_text = fetch_tab(SHEET_URL, BASE_TAB, need=[["outlet_id"], ["dt", "date"], ["orders"], ["order_source"]])
+        base_text = fetch_tab(SHEET_URL, BASE_TAB, need=[["outlet_id"], ["dt", "date"], ["orders"], ["order_source"]],
+                              gid=a.gid, allow_url_gid=True)
         (HERE / "base_1.csv").write_text(base_text, encoding="utf-8")
     stores, ix = load_stores(a.stores)
 
@@ -450,7 +516,13 @@ def main():
     out.write_text(html, encoding="utf-8")
     say(f"  wrote {out.name} ({out.stat().st_size/1024:,.0f} KB)   logo: {logo_note}")
     say(f"  stores in master: {len(stores)}   with data: {len(stores) - len(info['idle'])}   rows: {info['rows']:,}")
-    say(f"  data through {info['last_date']:%d-%b-%Y}   months: {info['months']}   weeks: {info['weeks']}")
+    say(f"  dates: {info['first_date']:%d-%b-%Y} to {info['last_date']:%d-%b-%Y}   months: {info['months']}   weeks: {info['weeks']}")
+    say(f"  dt column: read as {info['fmt'].replace('%', '')}  ({info['fmt_ok']} of {info['fmt_total']} different dates);"
+        f" sheet rows {info['n_in']:,}; first '{info['raw_first']}', last '{info['raw_last']}'")
+    if info["ambiguous"]:
+        say("  note: dd/mm and mm/dd both fit this column; read as day first. If wrong, tell me the real format.")
+    if info["bad_samples"]:
+        say("  unreadable dt examples: " + ", ".join(repr(x) for x in info["bad_samples"]))
     say(f"  reconcile  orders={info['orders']:,.0f}  GMV={info['gmv']:,.2f}  (max drift vs CSV {info['drift']:.2f})")
     say("  bills totals  " + "   ".join(f"{k}={v:,.0f}" for k, v in info["bill_totals"].items()))
 
@@ -463,7 +535,8 @@ def main():
     if age > MAX_STALE_DAYS:
         problems.append(f"newest data is {age} days old ({info['last_date']:%d-%b-%Y})")
     if info["bad_dt"]:
-        problems.append(f"{info['bad_dt']} row(s) skipped - unreadable dt")
+        problems.append(f"{info['bad_dt']} row(s) skipped - unreadable dt"
+                        + ("" if info["bad_dt"] > max(5, info["n_in"] // 100) else " (minor)"))
     if info["bad_src"]:
         say(f"  note: {info['bad_src']} row(s) skipped - Order_source not ECOM/POS")
     if info["skipped"]:
@@ -474,13 +547,14 @@ def main():
         say(f"  WARNING: {p}")
 
     say("3/4  Checks")
-    blocking = [p for p in problems if not p.endswith("unreadable dt")]
+    blocking = [p for p in problems if not p.endswith("(minor)")]
     if a.no_push:
         say("  --no-push: skipping GitHub.")
         say(f"4/4  Done. Open {out}")
         return
     if blocking and not a.force:
-        die("Not pushing because of the warnings above. Fix the data, or re-run with --force to push anyway.")
+        die("Not pushing because:\n  - " + "\n  - ".join(blocking) +
+            "\n  Fix the data, or re-run with --force to push anyway.")
     say("  ok" if not problems else "  continuing (--force or minor warnings)")
 
     say("4/4  Push to GitHub")
@@ -1190,7 +1264,7 @@ document.addEventListener('click',e=>{
 /* ---------- boot ---------- */
 (function(){
   const d=new Date(DATA.lastDate+'T00:00:00Z');
-  $('#chipDate').textContent=d.getUTCDate()+' '+MN[d.getUTCMonth()]+' '+d.getUTCFullYear();
+  $('#chipDate').textContent=String(d.getUTCDate()).padStart(2,'0')+'-'+MN[d.getUTCMonth()]+'-'+d.getUTCFullYear();
   $('#chipStores').textContent=stores.length;
   let open=!isMobile();
   try{const v=localStorage.getItem('m26_side');if(v!==null&&open)open=v==='1'}catch(_){}
