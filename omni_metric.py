@@ -131,8 +131,54 @@ def sid(v):
     return s
 
 
+MONTHS = {m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun",
+                                      "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+
+
+def loose_date(s, dayfirst=True, week=None):
+    """Last-resort reader for odd date text: '3rd Jul 2026', 'Fri, 03 Jul 2026', 'July 3, 2026', '03Jul2026', 20260703 ..."""
+    t = re.sub(r"(?i)\b(mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?", " ", s)
+    t = re.sub(r"(?i)(\d)(st|nd|rd|th)\b", r"\1", t).replace(",", " ").strip()
+
+    def mk(y, m, d):
+        y = y + 2000 if y < 100 else y
+        try:
+            return dt.date(y, m, d)
+        except ValueError:
+            return None
+
+    m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})", t)
+    if m:
+        return mk(int(m[1]), int(m[2]), int(m[3]))
+    m = re.search(r"(\d{4})[-/. ](\d{1,2})[-/. ](\d{1,2})", t)
+    if m:
+        return mk(int(m[1]), int(m[2]), int(m[3]))
+    m = re.search(r"(\d{1,2})[-/. ]*([A-Za-z]{3,9})[-/. ]*(\d{2,4})", t)
+    if m and m[2][:3].lower() in MONTHS:
+        return mk(int(m[3]), MONTHS[m[2][:3].lower()], int(m[1]))
+    m = re.search(r"([A-Za-z]{3,9})[-/. ]*(\d{1,2})[-/. ]+(\d{2,4})", t)
+    if m and m[1][:3].lower() in MONTHS:
+        return mk(int(m[3]), MONTHS[m[1][:3].lower()], int(m[2]))
+    m = re.search(r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})", t)
+    if m:
+        a, b, y = int(m[1]), int(m[2]), int(m[3])
+        if a > 12:
+            cands = [mk(y, b, a)]
+        elif b > 12:
+            cands = [mk(y, a, b)]
+        else:
+            cands = [mk(y, b, a), mk(y, a, b)] if dayfirst else [mk(y, a, b), mk(y, b, a)]
+        cands = [c for c in cands if c]
+        if week:                                   # the sheet's own Week column settles dd/mm vs mm/dd
+            for c in cands:
+                if c.isocalendar()[1] == week:
+                    return c
+        return cands[0] if cands else None
+    return None
+
+
 def clean_date_text(v):
-    s = str(v).strip()
+    s = re.sub(r"[\u00a0\u200b\u200e\u200f\u202f\ufeff]", " ", str(v)).strip()
     if not s:
         return ""
     if re.fullmatch(r"\d{5}(\.\d+)?", s):                     # Sheets/Excel serial number
@@ -161,8 +207,13 @@ class DateParser:
         self.ambiguous = bool(mirror and score[mirror] == self.ok)
         self.cache = {}
 
-    def __call__(self, raw):
+    def __call__(self, raw, week=None):
         s = clean_date_text(raw)
+        m = re.fullmatch(r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})", s)
+        if m and week and int(m[1]) <= 12 and int(m[2]) <= 12 and m[1] != m[2]:
+            d = loose_date(s, dayfirst=not self.fmt.startswith("%m"), week=week)
+            if d is not None:
+                return d                           # ambiguous d/m vs m/d: the Week column decides
         if s in self.cache:
             return self.cache[s]
         d = _try_date(s, self.fmt)
@@ -171,6 +222,10 @@ class DateParser:
                 d = _try_date(s, f)
                 if d:
                     break
+        if d is None:
+            d = loose_date(s, dayfirst=not self.fmt.startswith("%m"), week=week)
+            if d is not None and re.fullmatch(r"\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}", s):
+                return d                           # numeric + week hint: do not cache (hint is per row)
         self.cache[s] = d
         return d
 
@@ -367,6 +422,7 @@ def build_data(base_text, stores, store_ix):
         missing_cols.append("Scan_Percentage")
 
     dp = DateParser([r.get(k_dt, "") for r in rows_in])
+    k_week = pick(keys, ["Week"])
     out_rows, bad_dt, bad_src, skipped = [], 0, 0, 0
     bad_samples = []
     unknown, seen = set(), set()
@@ -374,11 +430,13 @@ def build_data(base_text, stores, store_ix):
     week_days, month_last = {}, {}
     last_date = None
     for r in rows_in:
-        d = dp(r.get(k_dt, ""))
+        wk_hint = int(num(r.get(k_week))) if k_week else None
+        d = dp(r.get(k_dt, ""), wk_hint)
         if d is None:
             bad_dt += 1
-            if len(bad_samples) < 5:
-                bad_samples.append(r.get(k_dt, ""))
+            raw = r.get(k_dt, "")
+            if raw not in bad_samples and len(bad_samples) < 6:
+                bad_samples.append(raw)
             continue
         src = r.get(k_src, "").strip().upper()
         if src not in ("ECOM", "POS"):
@@ -429,7 +487,7 @@ def build_data(base_text, stores, store_ix):
         "bad_dt": bad_dt, "bad_src": bad_src, "skipped": skipped, "unknown": unknown,
         "idle": [s[0] for s in stores if s[0] not in seen], "missing_cols": missing_cols,
         "fmt": dp.fmt, "fmt_ok": dp.ok, "fmt_total": dp.total, "ambiguous": dp.ambiguous, "bad_samples": bad_samples,
-        "first_date": min(dp(r.get(k_dt, "")) for r in rows_in if dp(r.get(k_dt, ""))),
+        "first_date": min(x for x in (dp(r.get(k_dt, "")) for r in rows_in[:2000] + rows_in[-2000:]) if x),
         "raw_first": rows_in[0].get(k_dt, ""), "raw_last": rows_in[-1].get(k_dt, ""), "n_in": len(rows_in),
         "bill_totals": {b: emb[[m[0] for m in METRICS].index(b)] for b in BILLS},
     }
@@ -535,7 +593,8 @@ def main():
     if age > MAX_STALE_DAYS:
         problems.append(f"newest data is {age} days old ({info['last_date']:%d-%b-%Y})")
     if info["bad_dt"]:
-        problems.append(f"{info['bad_dt']} row(s) skipped - unreadable dt"
+        eg = ", ".join(repr(x) for x in info["bad_samples"])
+        problems.append(f"{info['bad_dt']} row(s) skipped - unreadable dt, e.g. {eg}"
                         + ("" if info["bad_dt"] > max(5, info["n_in"] // 100) else " (minor)"))
     if info["bad_src"]:
         say(f"  note: {info['bad_src']} row(s) skipped - Order_source not ECOM/POS")
@@ -554,6 +613,7 @@ def main():
         return
     if blocking and not a.force:
         die("Not pushing because:\n  - " + "\n  - ".join(blocking) +
+            f"\n  dt column was read as {info['fmt'].replace('%', '')}; first '{info['raw_first']}', last '{info['raw_last']}'"
             "\n  Fix the data, or re-run with --force to push anyway.")
     say("  ok" if not problems else "  continuing (--force or minor warnings)")
 
