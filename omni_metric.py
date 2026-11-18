@@ -497,6 +497,8 @@ TEMPLATE = r'''<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Omni Metric | KPN Fresh</title>
+<link rel="icon" type="image/png" href="https://play-lh.googleusercontent.com/tt3fN6DFHea7-902eGXuDO8O7abRWnMbHWUOzdMGe6sR58E1VXdJSD4XJjuZNjuisD5dlUGXgyURv-QDlt6ZHw=w64-h64">
+<link rel="apple-touch-icon" href="https://play-lh.googleusercontent.com/tt3fN6DFHea7-902eGXuDO8O7abRWnMbHWUOzdMGe6sR58E1VXdJSD4XJjuZNjuisD5dlUGXgyURv-QDlt6ZHw=w180-h180">
 <style>
 :root{
   --brand:#08A977; --brand-d:#067A56; --brand-deep:#0A6B3F; --brand-soft:#E8F7F1; --brand-line:#BFE6D5;
